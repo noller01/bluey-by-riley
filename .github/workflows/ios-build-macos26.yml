@@ -1,0 +1,149 @@
+# Builds the Bluey iOS app on a macOS runner and packages it as an UNSIGNED .ipa.
+#
+# The resulting Bluey.ipa is NOT signed and NOT installable straight from
+# Explorer. It must be side-loaded onto the iPhone with Sideloadly (or
+# AltStore / AltServer) using the user's own Apple ID. With a free Apple ID
+# the signing certificate is only valid for 7 days, so the app has to be
+# re-installed roughly once a week.
+#
+# The build needs no secrets: code signing is disabled entirely.
+#
+# NOTE: the committed GooglyEyes.xcodeproj is used as-is. Do NOT run
+# `xcodegen generate` here - it would rewrite the committed project file and
+# could silently change the build.
+
+name: iOS Build (unsigned IPA, macOS 26)
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration'
+        type: choice
+        default: 'Release'
+        options:
+          - 'Release'
+          - 'Debug'
+      xcode_version:
+        description: 'Xcode version to use (e.g. 16.2). Leave empty for the runner default.'
+        type: string
+        required: false
+        default: ''
+
+
+permissions:
+  contents: read
+
+jobs:
+  build-unsigned-ipa:
+    name: Build unsigned Bluey.ipa
+    # macos-15 ships Xcode 16. The committed project uses objectVersion 77,
+    # which older Xcode (macos-14 / Xcode 15) cannot open.
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare build settings
+        run: |
+          set -euo pipefail
+          echo "DERIVED_DATA=$HOME/Library/Developer/Xcode/DerivedData" >> "$GITHUB_ENV"
+          echo "PACKAGE_DIR=$RUNNER_TEMP/bluey-ipa" >> "$GITHUB_ENV"
+
+      - name: Select Xcode
+        if: ${{ inputs.xcode_version != '' }}
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ inputs.xcode_version }}
+
+      - name: Report Xcode version
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          {
+            echo '### Build environment'
+            echo
+            echo '```'
+            xcodebuild -version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build Bluey.app (unsigned)
+        env:
+          CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+        run: |
+          set -euo pipefail
+          echo "CONFIGURATION=$CONFIGURATION" >> "$GITHUB_ENV"
+          SIGNING_ARGS=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" ENABLE_BITCODE=NO)
+          BUILD_ARGS=(-project GooglyEyes.xcodeproj -configuration "$CONFIGURATION" -destination 'generic/platform=iOS' -derivedDataPath "$DERIVED_DATA")
+
+          if xcodebuild "${BUILD_ARGS[@]}" -scheme GooglyEyes "${SIGNING_ARGS[@]}" build; then
+            echo "Built with scheme 'GooglyEyes'."
+          else
+            # The committed project ships no shared .xcscheme file, so fall back
+            # to building the target directly if the scheme cannot be resolved.
+            echo "::notice::Could not build with scheme 'GooglyEyes'; retrying with -target GooglyEyes."
+            xcodebuild "${BUILD_ARGS[@]}" -target GooglyEyes "${SIGNING_ARGS[@]}" build
+          fi
+
+      - name: Package Bluey.ipa
+        run: |
+          set -euo pipefail
+          APP_PATH=''
+          if [ -d "$DERIVED_DATA/Build/Products/${CONFIGURATION:-Release}-iphoneos/Bluey.app" ]; then
+            APP_PATH="$DERIVED_DATA/Build/Products/${CONFIGURATION:-Release}-iphoneos/Bluey.app"
+          else
+            APP_PATH="$(find "$DERIVED_DATA/Build/Products" -maxdepth 2 -type d -name 'Bluey.app' 2>/dev/null | head -n 1 || true)"
+          fi
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::Bluey.app was not produced by the build."
+            exit 1
+          fi
+          echo "Built app: $APP_PATH"
+
+          # Store Info.plist as XML so that the Windows install script can read
+          # the bundle id / version without a macOS-only plist tool.
+          if plutil -convert xml1 -o "$APP_PATH/Info.plist.xml" "$APP_PATH/Info.plist" 2>/dev/null; then
+            mv -f "$APP_PATH/Info.plist.xml" "$APP_PATH/Info.plist"
+          else
+            rm -f "$APP_PATH/Info.plist.xml" || true
+            echo "::notice::Could not convert Info.plist to XML; the original file was kept."
+          fi
+
+          rm -rf "$PACKAGE_DIR"
+          rm -f "$GITHUB_WORKSPACE/Bluey.ipa"
+          mkdir -p "$PACKAGE_DIR/Payload"
+          cp -R "$APP_PATH" "$PACKAGE_DIR/Payload/"
+          (cd "$PACKAGE_DIR" && zip -qry "$GITHUB_WORKSPACE/Bluey.ipa" Payload)
+          cp -f "$APP_PATH/Info.plist" "$GITHUB_WORKSPACE/Bluey-Info.plist"
+          ls -l "$GITHUB_WORKSPACE/Bluey.ipa"
+
+      - name: Summarise artifact
+        run: |
+          set -euo pipefail
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$GITHUB_WORKSPACE/Bluey-Info.plist" 2>/dev/null || true)"
+          SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$GITHUB_WORKSPACE/Bluey-Info.plist" 2>/dev/null || true)"
+          BUILD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$GITHUB_WORKSPACE/Bluey-Info.plist" 2>/dev/null || true)"
+          SHA256="$(shasum -a 256 "$GITHUB_WORKSPACE/Bluey.ipa" | cut -d' ' -f1 || true)"
+          {
+            echo '### Bluey.ipa'
+            echo
+            echo "- Bundle id: \`${BUNDLE_ID:-unknown}\`"
+            echo "- Version: \`${SHORT_VERSION:-unknown}\` (build \`${BUILD_VERSION:-unknown}\`)"
+            echo "- Configuration: \`${CONFIGURATION:-Release}\`"
+            echo "- SHA-256: \`${SHA256}\`"
+            echo
+            echo 'This IPA is **UNSIGNED**. Side-load it with Sideloadly/AltStore using your own Apple ID.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Bluey.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bluey-ipa-macos26
+          path: |
+            Bluey.ipa
+            Bluey-Info.plist
+          if-no-files-found: error
+          retention-days: 30

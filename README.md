@@ -104,3 +104,11 @@ The existing manual pointing, voice context, research cards, Codex controller an
 ## License
 
 Public domain under [the Unlicense](LICENSE). Do whatever you want with it.
+
+## Windows 11
+
+- The Mac menu bar app has a Windows 11 port; it lives in the separate `bluey-windows` folder and is built separately.
+- The iOS app is unchanged: nothing under `iOS/` or `Shared/` was touched by the Windows work.
+- You do not need a Mac to build the iPhone app: the `iOS Build (unsigned IPA)` workflow (`.github/workflows/ios-build.yml`) builds an unsigned `Bluey.ipa` on a GitHub-hosted macOS runner.
+- The `.ipa` is unsigned, so it is side-loaded onto the iPhone with Sideloadly (or AltStore) using your own Apple ID. A free Apple ID signs for 7 days only, so the app has to be re-installed roughly once a week.
+- On Windows, `bluey-windows\tools\Install-BlueyOnIPhone.ps1` validates the `.ipa` and opens Sideloadly with it; `bluey-windows\tools\Build-BlueyIpa.md` is the step-by-step guide for a non-technical user.
